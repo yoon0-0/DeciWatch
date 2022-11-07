@@ -120,6 +120,22 @@ class DeciWatch(nn.Module):
         return torch.tensor(encoder_mask).cuda(), torch.tensor(
             decoder_mask).cuda()
 
+    def generate_cross_unifrom_mask(self, L, sample_interval=10):
+        # 1 unseen 0 see
+
+        seq_len = L
+        if (seq_len - 1) % sample_interval != 0:
+            raise Exception(
+                "The following equation should be satisfied: [Window size] = [sample interval] * Q + 1, where Q is an integer."
+            )
+
+        sample_mask = np.ones(seq_len, dtype=np.int32)
+        sample_mask[5::sample_interval] = 0
+
+        cross_mask = sample_mask
+
+        return torch.tensor(cross_mask).cuda()
+
     def seqence_interpolation(self, motion, rate):
 
         seq_len = motion.shape[-1]
@@ -144,6 +160,8 @@ class DeciWatch(nn.Module):
 
         encoder_mask, decoder_mask = self.generate_unifrom_mask(
             L, sample_interval=self.sample_interval)
+        cross_mask = self.generate_cross_unifrom_mask(
+            L, sample_interval=self.sample_interval)
 
         self.input_seq = seq * (1 - encoder_mask.int())
         self.input_seq_interp = self.seqence_interpolation(
@@ -151,6 +169,7 @@ class DeciWatch(nn.Module):
         # self.input_seq=self.input_seq.reshape(1,1,-1)
         self.encoder_mask = encoder_mask.unsqueeze(0).repeat(B, 1).to(device)
         self.decoder_mask = decoder_mask.unsqueeze(0).repeat(B, 1).to(device)
+        self.cross_mask = cross_mask.unsqueeze(0).repeat(B, 1).to(device)
 
         self.encoder_pos_embed = self.pos_embed(B, L).to(device)
         self.decoder_pos_embed = self.encoder_pos_embed.clone().to(device)
@@ -161,6 +180,7 @@ class DeciWatch(nn.Module):
             encoder_pos_embed=self.encoder_pos_embed,
             input_seq_interp=self.input_seq_interp,
             decoder_mask=self.decoder_mask,
+            cross_mask = self.cross_mask,
             decoder_pos_embed=self.decoder_pos_embed,
             sample_interval=self.sample_interval,
             device=device)
@@ -196,6 +216,7 @@ class Transformer(nn.Module):
                                     stride=1,
                                     padding=2)
 
+        # Encoder
         self.encoder_embed = nn.Linear(self.joints_dim, encoder_hidden_dim)
 
         encoder_layer = TransformerEncoderLayer(encoder_hidden_dim, nhead,
@@ -204,7 +225,17 @@ class Transformer(nn.Module):
         encoder_norm = nn.LayerNorm(encoder_hidden_dim) if pre_norm else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers,
                                         encoder_norm)
+        # Cross encoder    
+        self.cross_encoder_embed = nn.Linear(self.joints_dim, encoder_hidden_dim)
 
+        cross_encoder_layer = TransformerEncoderLayer(encoder_hidden_dim, nhead,
+                                        dim_feedforward, dropout,
+                                        activation, pre_norm)
+        cross_encoder_norm = nn.LayerNorm(encoder_hidden_dim) if pre_norm else None
+
+        self.cross_encoder = TransformerEncoder(cross_encoder_layer, num_encoder_layers,
+                                        cross_encoder_norm)
+        # Decoder
         decoder_layer = TransformerDecoderLayer(decoder_hidden_dim, nhead,
                                                 dim_feedforward, dropout,
                                                 activation, pre_norm)
@@ -216,6 +247,9 @@ class Transformer(nn.Module):
                                             self.joints_dim)
         self.encoder_joints_embed = nn.Linear(encoder_hidden_dim,
                                             self.joints_dim)
+        self.cross_encoder_joints_embed = nn.Linear(encoder_hidden_dim,
+                                            self.joints_dim)
+
 
         # reset parameters
         for p in self.parameters():
@@ -236,7 +270,7 @@ class Transformer(nn.Module):
         return mask
 
     def forward(self, input_seq, encoder_mask, encoder_pos_embed,
-                input_seq_interp, decoder_mask, decoder_pos_embed,
+                input_seq_interp, decoder_mask, cross_mask, decoder_pos_embed,
                 sample_interval, device):
 
         self.device = device
@@ -250,9 +284,13 @@ class Transformer(nn.Module):
 
         # mask on all sequences:
         trans_src = self.encoder_embed(input_seq)
+        # print(encoder_mask, cross_mask)
         mem = self.encode(trans_src, encoder_mask,
                         encoder_pos_embed)  #[l,n,hid]
         reco = self.encoder_joints_embed(mem) + input
+        cross_mem = self.cross_encode(trans_src, cross_mask,
+                        encoder_pos_embed)  #[l,n,hid]
+
         
         interp = torch.nn.functional.interpolate(
             input=reco[::sample_interval, : , :].permute(1,2,0),
@@ -264,7 +302,7 @@ class Transformer(nn.Module):
         trans_tgt = self.decoder_embed(interp.permute(1, 2,
                                                     0)).permute(2, 0, 1)
 
-        output = self.decode(mem, encoder_mask, encoder_pos_embed, trans_tgt,
+        output = self.decode(cross_mem, cross_mask, encoder_pos_embed, trans_tgt,
                             decoder_mask, decoder_pos_embed)
 
         joints = self.decoder_joints_embed(output) + center
@@ -277,6 +315,16 @@ class Transformer(nn.Module):
 
         mask = torch.eye(src.shape[0]).bool().cuda()
         memory = self.encoder(src,
+                            mask=mask,
+                            src_key_padding_mask=src_mask,
+                            pos=pos_embed)
+
+        return memory
+
+    def cross_encode(self, src, src_mask, pos_embed):
+
+        mask = torch.eye(src.shape[0]).bool().cuda()
+        memory = self.cross_encoder(src,
                             mask=mask,
                             src_key_padding_mask=src_mask,
                             pos=pos_embed)
