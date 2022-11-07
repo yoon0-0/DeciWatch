@@ -173,14 +173,16 @@ class DeciWatch(nn.Module):
 
         self.encoder_pos_embed = self.pos_embed(B, L).to(device)
         self.decoder_pos_embed = self.encoder_pos_embed.clone().to(device)
+        self.cross_encoder_pos_embed = self.encoder_pos_embed.clone().to(device)
 
         self.recover, self.denoise = self.transformer.forward(
             input_seq=self.input_seq.to(torch.float32),
             encoder_mask=self.encoder_mask,
             encoder_pos_embed=self.encoder_pos_embed,
             input_seq_interp=self.input_seq_interp,
-            decoder_mask=self.decoder_mask,
             cross_mask = self.cross_mask,
+            cross_encoder_pos_embed=self.cross_encoder_pos_embed,
+            decoder_mask=self.decoder_mask,
             decoder_pos_embed=self.decoder_pos_embed,
             sample_interval=self.sample_interval,
             device=device)
@@ -270,7 +272,7 @@ class Transformer(nn.Module):
         return mask
 
     def forward(self, input_seq, encoder_mask, encoder_pos_embed,
-                input_seq_interp, decoder_mask, cross_mask, decoder_pos_embed,
+                input_seq_interp, cross_mask, cross_encoder_pos_embed, decoder_mask, decoder_pos_embed,
                 sample_interval, device):
 
         self.device = device
@@ -289,7 +291,7 @@ class Transformer(nn.Module):
                         encoder_pos_embed)  #[l,n,hid]
         reco = self.encoder_joints_embed(mem) + input
         cross_mem = self.cross_encode(trans_src, cross_mask,
-                        encoder_pos_embed)  #[l,n,hid]
+                        cross_encoder_pos_embed)  #[l,n,hid]
 
         
         interp = torch.nn.functional.interpolate(
@@ -302,7 +304,7 @@ class Transformer(nn.Module):
         trans_tgt = self.decoder_embed(interp.permute(1, 2,
                                                     0)).permute(2, 0, 1)
 
-        output = self.decode(cross_mem, cross_mask, encoder_pos_embed, trans_tgt,
+        output = self.decode(cross_mem, cross_mask, cross_encoder_pos_embed, trans_tgt,
                             decoder_mask, decoder_pos_embed)
 
         joints = self.decoder_joints_embed(output) + center
